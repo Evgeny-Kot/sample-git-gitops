@@ -1,0 +1,90 @@
+# Reconstructed example based on the GitLab / Harbor / Argo CD tutorial.
+# Adapt the variable values and manifest paths before use.
+# The Docker-in-Docker jobs require a privileged Kubernetes GitLab Runner.
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  IMAGE_REPO: "$REGISTRY_HOST/$REGISTRY_PROJECT/$CI_PROJECT_NAME"
+  IMAGE_TAG: "$CI_COMMIT_SHORT_SHA"
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: /certs
+  DOCKER_TLS_VERIFY: "1"
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+test:
+  stage: test
+  image: python:3.15.2-slim-trixie
+  script:
+    - python -m pip install --no-cache-dir -r requirements.txt pytest pyyaml
+    - python -m pytest -v
+
+build:
+  stage: build
+  image: docker:29.10.0-cli
+  services:
+    - name: docker:29.10.0-dind
+      alias: docker
+  before_script:
+    - echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+  script:
+    - docker build --pull -t "$IMAGE_REPO:$IMAGE_TAG" .
+    - docker push "$IMAGE_REPO:$IMAGE_TAG"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy_dev:
+  stage: deploy
+  image: alpine:3.24.4
+  needs: [build]
+  before_script:
+    - apk add --no-cache git sed
+    - git config --global user.name "GitLab CI"
+    - git config --global user.email "gitlab-ci@example.invalid"
+  script:
+    # GITOPS_REPO_AUTH_URL: HTTPS clone URL with a scoped write token stored as a masked CI variable.
+    # GITOPS_IMAGE_FILE: e.g. environments/dev/deployment.yaml
+    - git clone "$GITOPS_REPO_AUTH_URL" gitops
+    - cd gitops
+    - 'sed -i -E "s#(^[[:space:]]*image:[[:space:]]*).*#\\1$IMAGE_REPO:$IMAGE_TAG#" "$GITOPS_DEV_IMAGE_FILE"'
+    - git add "$GITOPS_DEV_IMAGE_FILE"
+    - 'git diff --cached --quiet || (git commit -m "ci: promote $IMAGE_TAG to dev [skip ci]" && git push origin HEAD)'
+  environment:
+    name: dev
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy_stage:
+  stage: deploy
+  image: docker:29.10.0-cli
+  services:
+    - name: docker:29.10.0-dind
+      alias: docker
+  needs: [build]
+  before_script:
+    - apk add --no-cache git sed
+    - echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin
+    - git config --global user.name "GitLab CI"
+    - git config --global user.email "gitlab-ci@example.invalid"
+  script:
+    - docker pull "$IMAGE_REPO:$IMAGE_TAG"
+    - docker tag "$IMAGE_REPO:$IMAGE_TAG" "$IMAGE_REPO:stage-$IMAGE_TAG"
+    - docker push "$IMAGE_REPO:stage-$IMAGE_TAG"
+    - git clone "$GITOPS_REPO_AUTH_URL" gitops
+    - cd gitops
+    - 'sed -i -E "s#(^[[:space:]]*image:[[:space:]]*).*#\\1$IMAGE_REPO:stage-$IMAGE_TAG#" "$GITOPS_STAGE_IMAGE_FILE"'
+    - git add "$GITOPS_STAGE_IMAGE_FILE"
+    - 'git diff --cached --quiet || (git commit -m "ci: promote $IMAGE_TAG to stage [skip ci]" && git push origin HEAD)'
+  environment:
+    name: stage
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
